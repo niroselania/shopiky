@@ -38,18 +38,16 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Comparar PDF de órdenes (Shopify) con planilla de stock</h1>
-  <p>Subí el PDF de picking y la planilla donde figuran los SKU con stock.
-     Se genera un Excel con cada <strong>número de orden</strong> y el <strong>artículo (SKU)</strong>
-     que <strong>no</strong> aparece en la planilla.</p>
+  <p>Subí el PDF de picking y la planilla base. La comparación se hace por
+     <strong>Item(SKU) + Color + Talle</strong> y se considera con stock solo si
+     <strong>Ubicación</strong> tiene contenido.</p>
   <form method="post" enctype="multipart/form-data">
     <label for="pdf">PDF de órdenes</label>
     <input type="file" name="pdf" id="pdf" accept=".pdf,application/pdf" required/>
     <label for="sheet">Planilla (Excel .xlsx / .xls o CSV)</label>
     <input type="file" name="sheet" id="sheet" accept=".csv,.xlsx,.xls,text/csv" required/>
-    <label for="sku_col">Nombre de la columna del SKU en la planilla (opcional)</label>
-    <input type="text" name="sku_col" id="sku_col" placeholder="ej: SKU, sku, Codigo"/>
-    <p class="hint">Si lo dejás vacío, se busca una columna llamada <code>sku</code>, <code>SKU</code>,
-      <code>codigo</code>, <code>código</code> o <code>articulo</code>; si no hay ninguna, se usa la primera columna.</p>
+    <p class="hint">Columnas esperadas de tu base: <code>Item</code>, <code>Color</code>, <code>Talle</code>, <code>Ubicación</code>.
+      Si los nombres cambian levemente, se detectan automáticamente.</p>
     <button type="submit">Generar Excel</button>
   </form>
   {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -73,7 +71,25 @@ def _normalize_sku(v: object) -> str | None:
     return s
 
 
-def _load_stock_skus(file_storage, sku_col_hint: str | None) -> set[str]:
+def _normalize_text(v: object) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v).strip().upper()
+
+
+def _pick_col(df: pd.DataFrame, preferred: list[str], aliases_regex: str) -> str:
+    normalized = {str(c).strip().casefold(): c for c in df.columns}
+    for p in preferred:
+        if p.casefold() in normalized:
+            return normalized[p.casefold()]
+    rx = re.compile(aliases_regex, re.I)
+    for c in df.columns:
+        if rx.match(str(c).strip()):
+            return c
+    raise ValueError(f"No encontré columna compatible con: {aliases_regex}")
+
+
+def _load_stock_keys(file_storage) -> set[tuple[str, str, str]]:
     name = (file_storage.filename or "").lower()
     raw = file_storage.read()
     if name.endswith(".csv"):
@@ -86,50 +102,45 @@ def _load_stock_skus(file_storage, sku_col_hint: str | None) -> set[str]:
         except Exception:
             df = pd.read_excel(io.BytesIO(raw), dtype=str)
 
-    hint = (sku_col_hint or "").strip()
-    col = None
-    if hint:
-        for c in df.columns:
-            if str(c).strip().lower() == hint.lower():
-                col = c
-                break
-        if col is None:
-            raise ValueError(f"No existe la columna «{hint}» en la planilla.")
-    else:
-        aliases = re.compile(r"^(sku|codigo|código|articulo|artículo|id.?articulo)$", re.I)
-        for c in df.columns:
-            if aliases.match(str(c).strip()):
-                col = c
-                break
-        if col is None:
-            col = df.columns[0]
+    col_item = _pick_col(df, ["Item"], r"^(item|sku|cod_item|id_item)$")
+    col_color = _pick_col(df, ["Color"], r"^(color)$")
+    col_talle = _pick_col(df, ["Talle"], r"^(talle|talla|size)$")
+    col_ubic = _pick_col(df, ["Ubicación", "Ubicacion"], r"^(ubicacion|ubicación|location)$")
 
-    skus: set[str] = set()
-    for v in df[col].tolist():
-        n = _normalize_sku(v)
-        if n is not None:
-            skus.add(n)
-            if n.isdigit():
-                skus.add(str(int(n)))
-    return skus
+    keys: set[tuple[str, str, str]] = set()
+    for _, row in df.iterrows():
+        ubic = _normalize_text(row.get(col_ubic))
+        if not ubic:
+            continue
+        item = _normalize_sku(row.get(col_item))
+        color = _normalize_text(row.get(col_color))
+        talle = _normalize_text(row.get(col_talle))
+        if not item or not color or not talle:
+            continue
+        keys.add((item, color, talle))
+        if item.isdigit():
+            keys.add((str(int(item)), color, talle))
+    return keys
 
 
-def _missing_rows(items: list[LineItem], in_stock: set[str]) -> list[dict]:
+def _missing_rows(items: list[LineItem], in_stock_keys: set[tuple[str, str, str]]) -> list[dict]:
     rows: list[dict] = []
 
-    def has_stock(sku: str) -> bool:
-        if sku in in_stock:
+    def has_stock(sku: str, color: str, talle: str) -> bool:
+        key = (_normalize_sku(sku) or "", _normalize_text(color), _normalize_text(talle))
+        if key in in_stock_keys:
             return True
-        if sku.isdigit():
+        if key[0].isdigit():
             try:
-                if str(int(sku)) in in_stock:
+                alt = (str(int(key[0])), key[1], key[2])
+                if alt in in_stock_keys:
                     return True
             except ValueError:
                 pass
         return False
 
     for it in items:
-        if not has_stock(it.sku):
+        if not has_stock(it.sku, it.color, it.size):
             rows.append(
                 {
                     "numero_orden": it.order_id,
@@ -161,8 +172,8 @@ def index():
                 os.close(fd)
                 pf.save(tmp_path)
                 items = parse_orders_from_pdf(tmp_path)
-                in_stock = _load_stock_skus(sf, request.form.get("sku_col"))
-                rows = _missing_rows(items, in_stock)
+                in_stock_keys = _load_stock_keys(sf)
+                rows = _missing_rows(items, in_stock_keys)
                 if not rows:
                     message = "No hay artículos fuera del listado (o no se pudieron leer ítems del PDF)."
                     return render_template_string(HTML, error=None, message=message)
