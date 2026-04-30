@@ -1,0 +1,8 @@
+services:
+  shopify-stock-check:
+    build: .
+    image: shopify-stock-check:local
+    ports:
+      - "5055:5055"
+    restart: unless-stopped
+    # Subidas de PDF hasta 50 MB (Flask ya lo limita; nginx delante debe permitir client_max_body_size si aplica)
