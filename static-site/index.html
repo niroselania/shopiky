@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shopify PDF -> Sin Stock</title>
+  <style>
+    :root { font-family: system-ui, Arial, sans-serif; }
+    body { max-width: 920px; margin: 28px auto; padding: 0 14px; }
+    h1 { font-size: 1.4rem; margin-bottom: 6px; }
+    .muted { color: #555; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input[type="file"], input[type="text"] { width: 100%; padding: 8px; }
+    button { margin-top: 14px; padding: 10px 14px; cursor: pointer; }
+    #log { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 10px; min-height: 88px; }
+  </style>
+</head>
+<body>
+  <h1>Comparar PDF Shopify con base de stock</h1>
+  <p class="muted">Subís el PDF de órdenes y una planilla (Excel/CSV) con SKU disponibles. Se descarga un Excel con los artículos que no figuran en tu base.</p>
+
+  <div class="card">
+    <label>PDF de órdenes Shopify</label>
+    <input id="pdfFile" type="file" accept="application/pdf,.pdf" />
+
+    <label>Planilla de stock (Excel .xlsx/.xls o CSV)</label>
+    <input id="sheetFile" type="file" accept=".xlsx,.xls,.csv,text/csv" />
+
+    <label>Columna SKU (opcional)</label>
+    <input id="skuCol" type="text" placeholder="Ej: SKU, sku, codigo" />
+
+    <button id="runBtn">Procesar y descargar Excel</button>
+  </div>
+
+  <div class="card">
+    <strong>Estado</strong>
+    <div id="log"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.min.mjs" type="module"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <script type="module">
+    import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.min.mjs';
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.worker.min.mjs';
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+
+    const NOISE_PREFIXES = [
+      'http://','https://','CANT. SKU','PICK UP','ENVIO N°','TREGGO N°','N° ORDEN',
+      'Precio total','Total pagado','Monto pendiente','Número de seguimiento','Escanear para',
+      'Etiqueta de Envío','BOLSA REGALO','No se han realizado','PENDIENTE DE PAGO','MIRAR CANTIDADES'
+    ];
+
+    const ITEM_RE = /(\d+)\s+(\d+)\s+(.+?)\s\/\s(\S+)/g;
+    const ORDER_RE = /#(\d{4,})/g;
+
+    function log(msg) {
+      logEl.textContent += `${msg}\n`;
+    }
+
+    function clearLog() {
+      logEl.textContent = '';
+    }
+
+    function isNoiseLine(line) {
+      const s = (line || '').trim();
+      if (!s) return true;
+      const low = s.toLowerCase();
+      if (s.startsWith('📬') || s.startsWith('🔗') || s.startsWith('⚠')) return true;
+      return NOISE_PREFIXES.some((p) => s.startsWith(p) || low.startsWith(p.toLowerCase()));
+    }
+
+    function splitColorDesc(rest) {
+      const idx = rest.lastIndexOf(' - ');
+      if (idx === -1) return { description: rest.trim(), color: '' };
+      return {
+        description: rest.slice(0, idx).trim(),
+        color: rest.slice(idx + 3).trim(),
+      };
+    }
+
+    function parseOrdersFromText(text) {
+      const lines = text.split(/\r?\n/);
+      let activeOrders = [];
+      const out = [];
+
+      for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        if (isNoiseLine(line)) continue;
+
+        const hashes = [...line.matchAll(ORDER_RE)].map((m) => m[1]);
+        if (hashes.length) {
+          activeOrders = hashes;
+          continue;
+        }
+
+        if (!activeOrders.length) continue;
+
+        const matches = [...line.matchAll(ITEM_RE)];
+        if (!matches.length) continue;
+
+        const nOrders = activeOrders.length;
+        matches.forEach((m, i) => {
+          const qty = Number(m[1]);
+          const sku = String(m[2]).trim();
+          const rest = m[3];
+          const size = String(m[4]).trim();
+          const { description, color } = splitColorDesc(rest);
+          const orderId = nOrders === 1 ? activeOrders[0] : (i === 0 ? activeOrders[0] : activeOrders[1]);
+
+          out.push({
+            numero_orden: orderId,
+            sku,
+            cantidad: qty,
+            color,
+            talle: size,
+            descripcion: description,
+          });
+        });
+      }
+      return out;
+    }
+
+    function linesFromTextItems(items, minX, maxX) {
+      const filtered = items.filter((it) => {
+        const x = it.transform?.[4] ?? 0;
+        return x >= minX && x < maxX;
+      });
+
+      filtered.sort((a, b) => {
+        const ay = a.transform?.[5] ?? 0;
+        const by = b.transform?.[5] ?? 0;
+        if (Math.abs(by - ay) > 1.5) return by - ay;
+        const ax = a.transform?.[4] ?? 0;
+        const bx = b.transform?.[4] ?? 0;
+        return ax - bx;
+      });
+
+      const lines = [];
+      let current = [];
+      let currentY = null;
+
+      for (const item of filtered) {
+        const y = item.transform?.[5] ?? 0;
+        if (currentY === null || Math.abs(y - currentY) <= 1.8) {
+          current.push(item);
+          currentY = currentY === null ? y : (currentY + y) / 2;
+        } else {
+          current.sort((a, b) => (a.transform?.[4] ?? 0) - (b.transform?.[4] ?? 0));
+          lines.push(current.map((x) => x.str).join(' ').replace(/\s+/g, ' ').trim());
+          current = [item];
+          currentY = y;
+        }
+      }
+      if (current.length) {
+        current.sort((a, b) => (a.transform?.[4] ?? 0) - (b.transform?.[4] ?? 0));
+        lines.push(current.map((x) => x.str).join(' ').replace(/\s+/g, ' ').trim());
+      }
+      return lines.join('\n');
+    }
+
+    async function parseOrdersFromPdf(pdfFile) {
+      const buf = await pdfFile.arrayBuffer();
+      const loadingTask = pdfjsLib.getDocument({ data: buf });
+      const pdf = await loadingTask.promise;
+      const out = [];
+
+      for (let i = 1; i <= pdf.numPages; i += 1) {
+        log(`Leyendo página ${i}/${pdf.numPages}...`);
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        const width = page.getViewport({ scale: 1 }).width;
+        const mid = width * 0.52;
+
+        const leftText = linesFromTextItems(content.items, 0, mid);
+        const rightText = linesFromTextItems(content.items, mid, Number.MAX_SAFE_INTEGER);
+
+        out.push(...parseOrdersFromText(leftText));
+        if (rightText.trim()) out.push(...parseOrdersFromText(rightText));
+      }
+
+      return out;
+    }
+
+    function normalizeSku(v) {
+      if (v === null || v === undefined) return null;
+      let s = String(v).trim();
+      if (!s || s.toLowerCase() === 'nan') return null;
+      if (/^\d+\.0$/.test(s)) s = s.slice(0, -2);
+      return s;
+    }
+
+    function loadStockSkus(sheetFile, skuColHint) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('No se pudo leer la planilla'));
+        reader.onload = () => {
+          try {
+            const wb = XLSX.read(reader.result, { type: 'array' });
+            const ws = wb.Sheets[wb.SheetNames[0]];
+            const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+            if (!rows.length) {
+              resolve(new Set());
+              return;
+            }
+
+            const columns = Object.keys(rows[0]);
+            let skuCol = null;
+
+            const hint = (skuColHint || '').trim().toLowerCase();
+            if (hint) {
+              skuCol = columns.find((c) => String(c).trim().toLowerCase() === hint) || null;
+              if (!skuCol) throw new Error(`No existe la columna ${skuColHint} en la planilla.`);
+            } else {
+              const aliases = /^(sku|codigo|código|articulo|artículo|id.?articulo)$/i;
+              skuCol = columns.find((c) => aliases.test(String(c).trim())) || columns[0];
+            }
+
+            const skus = new Set();
+            rows.forEach((r) => {
+              const n = normalizeSku(r[skuCol]);
+              if (!n) return;
+              skus.add(n);
+              if (/^\d+$/.test(n)) skus.add(String(Number(n)));
+            });
+            resolve(skus);
+          } catch (e) {
+            reject(e);
+          }
+        };
+        reader.readAsArrayBuffer(sheetFile);
+      });
+    }
+
+    function hasStock(sku, stockSet) {
+      if (stockSet.has(sku)) return true;
+      if (/^\d+$/.test(sku) && stockSet.has(String(Number(sku)))) return true;
+      return false;
+    }
+
+    function downloadMissingExcel(rows) {
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'sin_stock');
+      XLSX.writeFile(wb, 'ordenes_articulos_sin_stock.xlsx');
+    }
+
+    $('runBtn').addEventListener('click', async () => {
+      clearLog();
+
+      const pdfFile = $('pdfFile').files?.[0];
+      const sheetFile = $('sheetFile').files?.[0];
+      const skuCol = $('skuCol').value;
+
+      if (!pdfFile) {
+        log('Falta subir el PDF.');
+        return;
+      }
+      if (!sheetFile) {
+        log('Falta subir la planilla.');
+        return;
+      }
+
+      try {
+        log('Extrayendo ítems del PDF...');
+        const items = await parseOrdersFromPdf(pdfFile);
+        log(`Ítems detectados en PDF: ${items.length}`);
+
+        log('Leyendo base de stock...');
+        const stockSkus = await loadStockSkus(sheetFile, skuCol);
+        log(`SKU en base: ${stockSkus.size}`);
+
+        const missing = items.filter((it) => !hasStock(it.sku, stockSkus));
+        log(`Artículos sin stock detectados: ${missing.length}`);
+
+        if (!missing.length) {
+          log('No hay artículos fuera del listado.');
+          return;
+        }
+
+        downloadMissingExcel(missing);
+        log('Descarga lista: ordenes_articulos_sin_stock.xlsx');
+      } catch (err) {
+        console.error(err);
+        log(`Error: ${err.message || err}`);
+      }
+    });
+  </script>
+</body>
+</html>

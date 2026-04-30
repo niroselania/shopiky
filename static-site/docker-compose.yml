@@ -1,0 +1,7 @@
+services:
+  shopify-sin-stock-html:
+    build: .
+    image: shopify-sin-stock-html:local
+    ports:
+      - "8088:80"
+    restart: unless-stopped
